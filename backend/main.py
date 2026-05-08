@@ -13,21 +13,14 @@ import torchvision.transforms as T
 from huggingface_hub import hf_hub_download
 import torch.nn as nn
 import base64
+import asyncio
+from contextlib import asynccontextmanager
+from transformers import ViTModel
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # =====================
 # 모델 정의
 # =====================
-from transformers import ViTModel
-
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1.0):
         super().__init__()
@@ -74,20 +67,41 @@ class XrayViT(nn.Module):
 
 
 # =====================
-# 모델 로드 (서버 시작 시)
+# 전역 모델
 # =====================
 DEVICE = torch.device('cpu')
 model = None
 
-@app.on_event("startup")
-async def load_model():
+
+def load_model_sync():
     global model
     print("HuggingFace에서 모델 다운로드 중...")
     path = hf_hub_download(repo_id="NEMNEM0702/xrayvision", filename="best_model.pt")
-    model = XrayViT().to(DEVICE)
-    model.load_state_dict(torch.load(path, map_location=DEVICE))
-    model.eval()
+    m = XrayViT().to(DEVICE)
+    m.load_state_dict(torch.load(path, map_location=DEVICE))
+    m.eval()
+    model = m
     print("모델 로드 완료!")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, load_model_sync)
+    yield
+
+
+# =====================
+# FastAPI 앱
+# =====================
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # =====================
@@ -97,6 +111,7 @@ transform = T.Compose([
     T.ToTensor(),
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
+
 
 def load_image(file_bytes, filename):
     ext = filename.split('.')[-1].lower()
@@ -109,11 +124,13 @@ def load_image(file_bytes, filename):
         img_pil = Image.open(io.BytesIO(file_bytes)).convert('RGB')
     return img_pil.resize((224, 224), Image.BILINEAR)
 
+
 def overlay_mask(img_np, mask_np, color, alpha=0.45, threshold=0.3):
     binary  = (mask_np >= threshold).astype(np.uint8)
     colored = np.zeros_like(img_np)
     colored[binary == 1] = color
     return cv2.addWeighted(img_np.copy(), 1.0, colored, alpha, 0)
+
 
 def img_to_base64(img_np):
     _, buf = cv2.imencode('.png', cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
@@ -125,13 +142,20 @@ def img_to_base64(img_np):
 # =====================
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model_ready": model is not None}
+
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
+    if model is None:
+        return JSONResponse(
+            {"error": "모델 로딩 중입니다. 잠시 후 다시 시도해주세요."},
+            status_code=503
+        )
+
     file_bytes = await file.read()
-    img_pil = load_image(file_bytes, file.filename)
-    img_np  = np.array(img_pil)
+    img_pil    = load_image(file_bytes, file.filename)
+    img_np     = np.array(img_pil)
     img_tensor = transform(img_pil).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
@@ -141,18 +165,16 @@ async def predict(file: UploadFile = File(...)):
     pred_mask = seg_map.squeeze().cpu().numpy()
     status    = 'ABNORMAL' if prob >= 0.5 else 'NORMAL'
     color     = (255, 50, 50) if prob >= 0.5 else (50, 200, 50)
-
     overlaid  = overlay_mask(img_np, pred_mask, color=color)
 
-    # 히트맵 컬러맵 적용
     mask_colored = (pred_mask * 255).astype(np.uint8)
     mask_colored = cv2.applyColorMap(mask_colored, cv2.COLORMAP_HOT)
     mask_colored = cv2.cvtColor(mask_colored, cv2.COLOR_BGR2RGB)
 
     return JSONResponse({
-        "status": status,
+        "status":      status,
         "probability": round(prob * 100, 1),
-        "original":  img_to_base64(img_np),
-        "heatmap":   img_to_base64(mask_colored),
-        "overlay":   img_to_base64(overlaid),
+        "original":    img_to_base64(img_np),
+        "heatmap":     img_to_base64(mask_colored),
+        "overlay":     img_to_base64(overlaid),
     })
