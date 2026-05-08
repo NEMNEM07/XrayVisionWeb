@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+torch
+torchvision
+transformers
+huggingface_hub
+pydicom
+pillow
+opencv-python-headless
+numpy
+python-multipart
